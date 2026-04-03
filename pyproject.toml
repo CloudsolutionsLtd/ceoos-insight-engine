@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "insight-engine"
+version = "1.0.0"
+description = "CEO OS Insight Engine - AI-Powered Daily Summaries"
+authors = ["CEO OS Team"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.104.1"
+uvicorn = {extras = ["standard"], version = "^0.24.0"}
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+kafka-python = "^2.0.2"
+redis = "^5.0.1"
+asyncpg = "^0.29.0"
+numpy = "^1.26.2"
+pandas = "^2.1.3"
+scikit-learn = "^1.3.2"
+transformers = "^4.36.0"
+torch = "^2.1.1"
+nltk = "^3.8.1"
+textblob = "^0.17.1"
+prometheus-client = "^0.19.0"
+python-json-logger = "^2.0.7"
+celery = "^5.3.4"
+openai = "^1.3.0"
+jinja2 = "^3.1.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pytest-cov = "^4.1.0"
+black = "^23.11.0"
+isort = "^5.12.0"
+flake8 = "^6.1.0"
+mypy = "^1.7.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
