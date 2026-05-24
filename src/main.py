@@ -114,7 +114,7 @@ async def lifespan(app: FastAPI):
             client_id="insight-engine",
             acks="all",
             retries=3,
-            compression_type="snappy"
+            compression_type="gzip"
         )
         await kafka_producer.start()
         logger.info("✅ Connected to Kafka", extra={"servers": settings.kafka_bootstrap_servers})
