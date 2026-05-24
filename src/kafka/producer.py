@@ -22,7 +22,7 @@ class KafkaProducer:
         client_id: str = "insight-engine",
         acks: str = "all",
         retries: int = 3,
-        compression_type: str = "snappy"
+        compression_type: str = "gzip"
     ):
         self.bootstrap_servers = bootstrap_servers
         self.client_id = client_id
