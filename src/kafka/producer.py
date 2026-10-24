@@ -4,6 +4,8 @@ Kafka producer for the Insight Engine.
 
 import json
 import logging
+
+from src.config import settings
 from typing import Optional, Any, Dict
 from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaConnectionError
@@ -35,6 +37,7 @@ class KafkaProducer:
         """Start the Kafka producer."""
         try:
             self.producer = AIOKafkaProducer(
+                security_protocol="SSL" if settings.kafka_ssl else "PLAINTEXT",
                 bootstrap_servers=self.bootstrap_servers,
                 client_id=self.client_id,
                 acks=self.acks,
