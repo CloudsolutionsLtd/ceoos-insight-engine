@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, date
 from typing import List, Dict, Any, Optional, Tuple
 import logging
 import json
+import math
 import asyncio
 import uuid
 from enum import Enum
@@ -31,6 +32,22 @@ from src.exceptions import GenerationError, InsufficientDataError
 logger = get_logger(__name__)
 
 # Constants
+
+def _clean_json(obj):
+    """Replace NaN/Infinity (invalid in Postgres JSON) with None, recursively."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {str(k): _clean_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_json(v) for v in obj]
+    return obj
+
+
+def _db_json(obj) -> str:
+    """JSON for JSONB columns: datetimes as strings, no NaN/Infinity."""
+    return json.dumps(_clean_json(json.loads(json.dumps(obj, default=str))), allow_nan=False)
+
 MIN_DATA_POINTS = 5
 HIGH_CONFIDENCE_THRESHOLD = 20
 MEDIUM_CONFIDENCE_THRESHOLD = 10
@@ -657,7 +674,8 @@ class DailySummaryGenerator:
         for row in rows:
             events.append(KeyEvent(
                 type='FRAUD_ALERT',
-                severity=row['risk_level'],
+                # Fraud risk levels -> event severities
+                severity={'LOW': 'INFO', 'MEDIUM': 'WARNING', 'HIGH': 'ERROR'}.get(row['risk_level'], 'CRITICAL'),
                 description=f"High-risk transaction of ${float(row['amount']):,.2f} detected",
                 impact=f"Risk score: {float(row['risk_score']):.2f}",
                 timestamp=row['timestamp'],
@@ -723,7 +741,7 @@ class DailySummaryGenerator:
             if len(rows) < 14:  # Need at least 2 weeks for trend analysis
                 return trends
             
-            df = pd.DataFrame(rows)
+            df = pd.DataFrame([dict(r) for r in rows])
             df['date'] = pd.to_datetime(df['date'])
             df = df.set_index('date')
             
@@ -838,7 +856,7 @@ class DailySummaryGenerator:
         risks = []
         
         # Fraud risk
-        fraud_alerts = metrics.get('fraud_alerts', Metric(name='', value=0)).value
+        fraud_alerts = metrics.get('fraud_alerts', Metric(name='missing', value=0)).value
         if fraud_alerts >= self.rules['fraud_alert_thresholds']['critical']:
             risks.append({
                 'type': 'FRAUD',
@@ -892,7 +910,7 @@ class DailySummaryGenerator:
             })
         
         # Growth risk
-        revenue_trend = metrics.get('revenue', Metric(name='', value=0)).trend
+        revenue_trend = metrics.get('revenue', Metric(name='missing', value=0)).trend
         if revenue_trend in ['down', 'strong_down']:
             risks.append({
                 'type': 'GROWTH',
@@ -948,7 +966,7 @@ class DailySummaryGenerator:
             })
         
         # Vendor diversification opportunities
-        unique_vendors = metrics.get('unique_vendors', Metric(name='', value=0)).value
+        unique_vendors = metrics.get('unique_vendors', Metric(name='missing', value=0)).value
         if unique_vendors < 5:
             opportunities.append({
                 'type': OpportunityType.VENDOR_DIVERSIFICATION.value,
@@ -1025,7 +1043,7 @@ class DailySummaryGenerator:
             ))
         
         # Add trend-based recommendations
-        revenue_trend = metrics.get('revenue', Metric(name='', value=0)).trend
+        revenue_trend = metrics.get('revenue', Metric(name='missing', value=0)).trend
         if revenue_trend in ['down', 'strong_down']:
             recommendations.append(Recommendation(
                 title="Address Revenue Decline",
@@ -1071,8 +1089,8 @@ class DailySummaryGenerator:
     ) -> str:
         """Generate summary using OpenAI."""
         
-        profit = metrics.get('profit', Metric(name='', value=0))
-        revenue = metrics.get('revenue', Metric(name='', value=0))
+        profit = metrics.get('profit', Metric(name='missing', value=0))
+        revenue = metrics.get('revenue', Metric(name='missing', value=0))
         
         prompt = f"""
         Generate a concise executive summary for a CEO based on this daily business data:
@@ -1080,8 +1098,8 @@ class DailySummaryGenerator:
         Key Metrics:
         - Profit: ${profit.value:,.2f} ({profit.trend} by {abs(profit.change_percentage or 0):.1f}%)
         - Revenue: ${revenue.value:,.2f}
-        - Transactions: {metrics.get('transactions', Metric(name='', value=0)).value}
-        - Fraud Alerts: {metrics.get('fraud_alerts', Metric(name='', value=0)).value}
+        - Transactions: {metrics.get('transactions', Metric(name='missing', value=0)).value}
+        - Fraud Alerts: {metrics.get('fraud_alerts', Metric(name='missing', value=0)).value}
         
         Events: {len(events)} key events
         High-priority risks: {len([r for r in risks if r.get('impact') in ['CRITICAL', 'HIGH']])}
@@ -1117,7 +1135,7 @@ class DailySummaryGenerator:
     ) -> str:
         """Render executive summary using template."""
         
-        profit = metrics.get('profit', Metric(name='', value=0))
+        profit = metrics.get('profit', Metric(name='missing', value=0))
         
         profit_desc = f"Profit of ${profit.value:,.2f}"
         if profit.trend in ['up', 'strong_up']:
@@ -1243,19 +1261,21 @@ class DailySummaryGenerator:
                 insight.date,
                 insight.summary,
                 insight.executive_summary,
-                json.dumps({k: v.dict() for k, v in insight.metrics.items()}),
-                json.dumps([e.dict() for e in insight.key_events]),
-                json.dumps([r.dict() for r in insight.recommendations]),
-                json.dumps(insight.risks),
-                json.dumps(insight.opportunities),
+                _db_json({k: v.dict() for k, v in insight.metrics.items()}),
+                _db_json([e.dict() for e in insight.key_events]),
+                _db_json([r.dict() for r in insight.recommendations]),
+                _db_json(insight.risks),
+                _db_json(insight.opportunities),
                 insight.sentiment,
                 insight.confidence,
-                json.dumps(insight.metadata) if insight.metadata else None,
+                _db_json(insight.metadata) if insight.metadata else None,
                 insight.generated_at
             )
 
     async def _publish_insight(self, insight: DailyInsight):
         """Publish insight to Kafka."""
+        if not self.kafka:
+            return
         try:
             await self.kafka.send(
                 'daily_insights',
@@ -1280,6 +1300,8 @@ class DailySummaryGenerator:
 
     async def _trigger_notifications(self, insight: DailyInsight):
         """Trigger notifications for high-priority items."""
+        if not self.kafka:
+            return
         high_priority_recs = [
             r for r in insight.recommendations 
             if r.priority in [InsightPriority.CRITICAL, InsightPriority.HIGH]
@@ -1302,7 +1324,7 @@ class DailySummaryGenerator:
                         'critical_risks': critical_risks,
                         'summary': insight.executive_summary,
                         'timestamp': datetime.utcnow().isoformat()
-                    })
+                    }, default=str)
                 )
                 self.logger.info(
                     f"High-priority notifications triggered for account {insight.account_id}",

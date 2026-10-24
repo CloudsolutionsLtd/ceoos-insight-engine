@@ -24,7 +24,7 @@ RUN pip install --no-cache-dir poetry==1.7.0
 RUN poetry config virtualenvs.create false
 
 # Install dependencies (including dev dependencies for testing)
-RUN poetry install --no-interaction --no-ansi --no-root
+RUN poetry install --no-interaction --no-ansi --no-root --only main
 
 # Copy application code
 COPY src/ ./src/
@@ -141,12 +141,11 @@ RUN mkdir -p /app/logs /app/data /app/security-reports && \
 # Switch to non-root user
 USER appuser
 
-# Expose port
-EXPOSE 3004
+# Port 3006 (the gateway's INSIGHT_SERVICE_URL); 3004 belongs to decision-engine.
+ENV PORT=3006 PYTHONUNBUFFERED=1
+EXPOSE 3006
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:3004/health || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
-# Run the application
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "3004", "--workers", "2"]
+CMD ["sh", "-c", "exec uvicorn src.main:app --host 0.0.0.0 --port ${PORT} --workers 2"]
