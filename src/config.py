@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     redis_password: Optional[str] = None
     redis_db: int = 0
     redis_tls: bool = False
+    redis_cluster: bool = False  # MemoryDB / ElastiCache cluster mode
 
     # PostgreSQL
     postgres_host: str = "localhost"
@@ -30,10 +31,15 @@ class Settings(BaseSettings):
     postgres_ssl: bool = False
     db_pool_min_size: int = 2
     db_pool_max_size: int = 10
+    db_statement_timeout_ms: int = 30000
+    run_migrations: bool = True  # false when a migration Job applies the schema
 
     # Kafka
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_ssl: bool = False
+    kafka_sasl_mechanism: Optional[str] = None
+    kafka_sasl_username: Optional[str] = None
+    kafka_sasl_password: Optional[str] = None
     kafka_group_id: str = "insight-engine-group"
     # Must match fraud-service topic names
     kafka_transactions_topic: str = "transactions"
