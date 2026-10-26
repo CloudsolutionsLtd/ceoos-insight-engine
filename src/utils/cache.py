@@ -1,56 +1,56 @@
+"""
+In-process TTL cache for async API handlers.
+
+The previous decorator was synchronous: on an async function it cached the
+coroutine object, so a cache hit returned an already-awaited coroutine
+("cannot reuse already awaited coroutine"), and because the key included
+repr(request) it also grew without bound. This version awaits the function,
+bounds the cache, expires entries and leaves per-request objects out of the
+key. The caller's data scope (api_key / tenant) stays in the key, so tenants
+never see each other's cached responses.
+"""
+
 import functools
+import hashlib
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Optional
 
-_cache = {}
-_cache_times = {}
+_SKIP = ("Request", "BackgroundTasks", "Response")
+MAX_ENTRIES = 4096
+
+
+def _part(v: Any) -> str:
+    return "" if type(v).__name__ in _SKIP else repr(v)
+
 
 def cache_result(func=None, *, ttl_seconds: Optional[int] = None):
-    """
-    Decorator to cache function results with optional TTL
-    
-    Can be used as:
-    @cache_result
-    or
-    @cache_result(ttl_seconds=3600)
-    """
+    ttl = ttl_seconds or 300
+
     def decorator(f: Callable) -> Callable:
+        store: "OrderedDict[str, tuple]" = OrderedDict()
+
         @functools.wraps(f)
-        def wrapper(*args, **kwargs) -> Any:
-            # Create cache key from function name and arguments
-            cache_key = f"{f.__name__}:{str(args)}:{str(kwargs)}"
-            
-            # Check if cache exists and is still valid
-            current_time = time.time()
-            if cache_key in _cache:
-                if ttl_seconds is None:
-                    # No TTL, return cached value
-                    return _cache[cache_key]
-                elif current_time - _cache_times.get(cache_key, 0) < ttl_seconds:
-                    # TTL not expired
-                    return _cache[cache_key]
-            
-            # Cache miss or expired, call the function
-            result = f(*args, **kwargs)
-            _cache[cache_key] = result
-            _cache_times[cache_key] = current_time
+        async def wrapper(*args, **kwargs) -> Any:
+            raw = f.__qualname__ + "|" + "|".join(_part(a) for a in args) + "|" + "|".join(
+                f"{k}={_part(v)}" for k, v in sorted(kwargs.items()))
+            key = hashlib.sha256(raw.encode()).hexdigest()
+            now = time.monotonic()
+            hit = store.get(key)
+            if hit and now - hit[1] < ttl:
+                store.move_to_end(key)
+                return hit[0]
+            result = await f(*args, **kwargs)
+            store[key] = (result, now)
+            store.move_to_end(key)
+            while len(store) > MAX_ENTRIES:
+                store.popitem(last=False)
             return result
+
         return wrapper
-    
-    if func is None:
-        # Called with parameters like @cache_result(ttl_seconds=3600)
-        return decorator
-    else:
-        # Called without parameters like @cache_result
-        return decorator(func)
+
+    return decorator if func is None else decorator(func)
+
 
 def cache_response(func=None, *, ttl_seconds: Optional[int] = None):
-    """
-    Decorator to cache API responses with optional TTL
-    
-    Can be used as:
-    @cache_response
-    or
-    @cache_response(ttl_seconds=3600)
-    """
     return cache_result(func=func, ttl_seconds=ttl_seconds)

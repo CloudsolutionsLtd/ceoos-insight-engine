@@ -20,6 +20,7 @@ from jinja2 import Environment, FileSystemLoader
 import aiohttp
 from decimal import Decimal
 
+from src.utils import tenant
 from src.models.insight import (
     DailyInsight, Metric, KeyEvent, Recommendation,
     InsightType, InsightPriority, InsightStatus
@@ -241,7 +242,6 @@ class DailySummaryGenerator:
         }
 
     @track_generation_time('daily_summary')
-    @cache_result(ttl_seconds=3600)  # Cache for 1 hour
     async def generate_daily_summary(
         self, 
         account_id: str,
@@ -479,7 +479,7 @@ class DailySummaryGenerator:
                     COALESCE(AVG(amount), 0) as avg_transaction,
                     COUNT(DISTINCT vendor_id) as unique_vendors
                 FROM transactions
-                WHERE account_id = $1
+                WHERE account_id = $1 AND tenant_ok(company_id)
                     AND DATE(transaction_date) = $2
                     AND status = 'COMPLETED'
             ),
@@ -488,7 +488,7 @@ class DailySummaryGenerator:
                     COUNT(*) as fraud_alerts,
                     COUNT(CASE WHEN risk_level = 'HIGH' OR risk_level = 'CRITICAL' THEN 1 END) as high_risk_alerts
                 FROM fraud_alerts
-                WHERE account_id = $1
+                WHERE account_id = $1 AND tenant_ok(company_id)
                     AND DATE(timestamp) = $2
             )
             SELECT 
@@ -523,7 +523,7 @@ class DailySummaryGenerator:
                 SUM(CASE WHEN type = 'CREDIT' THEN amount ELSE 0 END) as revenue,
                 SUM(CASE WHEN type = 'DEBIT' THEN amount ELSE 0 END) as expenses
             FROM transactions
-            WHERE account_id = $1
+            WHERE account_id = $1 AND tenant_ok(company_id)
                 AND DATE(transaction_date) BETWEEN $2 AND $3
                 AND status = 'COMPLETED'
         """, account_id, start_date, end_date)
@@ -598,7 +598,7 @@ class DailySummaryGenerator:
                     DATE(transaction_date) as date,
                     SUM(CASE WHEN type = 'DEBIT' THEN amount ELSE 0 END) * -1 as daily_burn
                 FROM transactions
-                WHERE account_id = $1
+                WHERE account_id = $1 AND tenant_ok(company_id)
                     AND transaction_date > NOW() - INTERVAL '30 days'
                     AND type = 'DEBIT'
                 GROUP BY DATE(transaction_date)
@@ -617,7 +617,7 @@ class DailySummaryGenerator:
                 END
             ), 0) as balance
             FROM transactions
-            WHERE account_id = $1
+            WHERE account_id = $1 AND tenant_ok(company_id)
                 AND status = 'COMPLETED'
         """, account_id)
         
@@ -663,7 +663,7 @@ class DailySummaryGenerator:
         """Get fraud-related events."""
         rows = await conn.fetch("""
             SELECT * FROM fraud_alerts
-            WHERE account_id = $1
+            WHERE account_id = $1 AND tenant_ok(company_id)
                 AND DATE(timestamp) = $2
                 AND risk_level IN ('HIGH', 'CRITICAL')
             ORDER BY risk_score DESC
@@ -689,7 +689,7 @@ class DailySummaryGenerator:
         """Get large transaction events."""
         rows = await conn.fetch("""
             SELECT * FROM transactions
-            WHERE account_id = $1
+            WHERE account_id = $1 AND tenant_ok(company_id)
                 AND DATE(transaction_date) = $2
                 AND amount > 10000
             ORDER BY amount DESC
@@ -732,7 +732,7 @@ class DailySummaryGenerator:
                     SUM(CASE WHEN type = 'DEBIT' THEN amount ELSE 0 END) as expenses,
                     COUNT(*) as transactions
                 FROM transactions
-                WHERE account_id = $1
+                WHERE account_id = $1 AND tenant_ok(company_id)
                     AND transaction_date > NOW() - INTERVAL '90 days'
                 GROUP BY DATE(transaction_date)
                 ORDER BY date
@@ -1227,7 +1227,7 @@ class DailySummaryGenerator:
         async with self.db.acquire() as conn:
             row = await conn.fetchrow("""
                 SELECT * FROM daily_insights
-                WHERE account_id = $1 AND date = $2
+                WHERE account_id = $1 AND tenant_ok(company_id) AND date = $2
             """, account_id, target_date)
             
             if row:
@@ -1241,9 +1241,9 @@ class DailySummaryGenerator:
                 INSERT INTO daily_insights (
                     id, account_id, date, summary, executive_summary,
                     metrics, key_events, recommendations, risks, opportunities,
-                    sentiment, confidence, metadata, generated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                ON CONFLICT (account_id, date) DO UPDATE SET
+                    sentiment, confidence, metadata, generated_at, company_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                ON CONFLICT (company_id, account_id, date) DO UPDATE SET
                     summary = EXCLUDED.summary,
                     executive_summary = EXCLUDED.executive_summary,
                     metrics = EXCLUDED.metrics,
@@ -1269,7 +1269,8 @@ class DailySummaryGenerator:
                 insight.sentiment,
                 insight.confidence,
                 _db_json(insight.metadata) if insight.metadata else None,
-                insight.generated_at
+                insight.generated_at,
+                tenant.company() or "",
             )
 
     async def _publish_insight(self, insight: DailyInsight):
@@ -1289,7 +1290,7 @@ class DailySummaryGenerator:
     async def _cache_insight(self, insight: DailyInsight):
         """Cache insight in Redis."""
         try:
-            cache_key = f"insight:{insight.account_id}:{insight.date}"
+            cache_key = tenant.scoped(f"insight:{insight.account_id}:{insight.date}")
             await self.redis.setex(
                 cache_key,
                 CACHE_TTL_HOURS * 3600,
