@@ -135,7 +135,7 @@ class Metric(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     name: str = Field(..., min_length=1, max_length=100)
-    value: float = Field(..., ge=0)
+    value: float = Field(...)  # can be negative (e.g. profit, cash flow)
     
     previous_value: Optional[float] = None
     week_ago_value: Optional[float] = None

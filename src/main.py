@@ -27,7 +27,7 @@ from src.models.insight import DailyInsight, InsightType, InsightPriority, Insig
 from src.utils.logging import setup_logging, get_logger
 from src.utils.metrics import setup_metrics, track_request
 from src.utils.cache import cache_response
-from src.utils.auth import verify_api_key
+from src.utils.auth import ALL_COMPANIES, company_of, verify_api_key
 from src.utils.exceptions import (
     AppException,
     not_found_handler,
@@ -54,6 +54,17 @@ DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
 
 
+async def _init_db_connection(conn) -> None:
+    """Decode JSON/JSONB to Python objects (asyncpg returns str by default)."""
+    for typ in ("json", "jsonb"):
+        await conn.set_type_codec(
+            typ,
+            encoder=lambda v: v if isinstance(v, str) else json.dumps(v, default=str),
+            decoder=json.loads,
+            schema="pg_catalog",
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, db_pool, kafka_producer, summary_generator, kafka_consumer, openai_client
@@ -73,6 +84,7 @@ async def lifespan(app: FastAPI):
             password=settings.redis_password,
             db=settings.redis_db,
             decode_responses=True,
+            ssl=settings.redis_tls,
             socket_timeout=5,
             socket_connect_timeout=5,
             retry_on_timeout=True,
@@ -97,7 +109,9 @@ async def lifespan(app: FastAPI):
             server_settings={
                 'timezone': 'UTC',
                 'application_name': 'insight-engine'
-            }
+            },
+            ssl="require" if settings.postgres_ssl else None,
+            init=_init_db_connection,
         )
         async with db_pool.acquire() as conn:
             await conn.execute("SELECT 1")
@@ -145,7 +159,7 @@ async def lifespan(app: FastAPI):
         # Start Kafka consumer — non-fatal if unavailable
         logger.info("Starting Kafka consumer...")
         try:
-            kafka_consumer = InsightConsumer(summary_generator)
+            kafka_consumer = InsightConsumer(summary_generator, db_pool)
             asyncio.create_task(kafka_consumer.start())
             logger.info("✅ Kafka consumer started")
         except Exception as e:
@@ -215,7 +229,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins or ["*"],
+    allow_origins=settings.get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -274,6 +288,17 @@ async def generic_exception_handler(request: Request, exc: Exception):
             "request_id": getattr(request.state, "request_id", None)
         }
     )
+
+
+def row_to_insight(row) -> DailyInsight:
+    """Build the API model from a DB row, tolerating NULLs and non-finite metrics."""
+    data = {k: v for k, v in dict(row).items() if v is not None and k != "company_id"}
+    metrics = data.get("metrics") or {}
+    # Non-finite values (e.g. infinite runway) are stored as null; omit them.
+    data["metrics"] = {
+        name: m for name, m in metrics.items() if isinstance(m, dict) and m.get("value") is not None
+    }
+    return DailyInsight(**data)
 
 
 # ============================================================================
@@ -360,8 +385,9 @@ async def get_daily_insight(
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM daily_insights WHERE account_id = $1 AND date = $2",
-            account_id, insight_date
+            "SELECT * FROM daily_insights WHERE account_id = $1 AND date = $2"
+            " AND ($3 = '*' OR company_id = $3)",
+            account_id, insight_date, api_key
         )
         if not row:
             raise HTTPException(
@@ -372,7 +398,7 @@ async def get_daily_insight(
             metrics.insights_retrieved.labels(account_id=account_id[:8], insight_type="daily").inc()
         except Exception:
             pass
-        return DailyInsight(**dict(row))
+        return row_to_insight(row)
 
 
 @app.get("/insights/daily/{account_id}/latest", response_model=DailyInsight, tags=["Insights"])
@@ -385,12 +411,13 @@ async def get_latest_daily_insight(
 ):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM daily_insights WHERE account_id = $1 ORDER BY date DESC LIMIT 1",
-            account_id
+            "SELECT * FROM daily_insights WHERE account_id = $1"
+            " AND ($2 = '*' OR company_id = $2) ORDER BY date DESC LIMIT 1",
+            account_id, api_key
         )
         if not row:
             raise HTTPException(status_code=404, detail=f"No insights found for {account_id}")
-        return DailyInsight(**dict(row))
+        return row_to_insight(row)
 
 
 @app.post("/insights/daily/generate/{account_id}", tags=["Insights"], status_code=202)
@@ -408,8 +435,9 @@ async def generate_daily_insight(
     if not force:
         async with db_pool.acquire() as conn:
             exists = await conn.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM daily_insights WHERE account_id = $1 AND date = $2)",
-                account_id, target_date
+                "SELECT EXISTS(SELECT 1 FROM daily_insights WHERE account_id = $1 AND date = $2"
+                " AND ($3 = '*' OR company_id = $3))",
+                account_id, target_date, api_key
             )
             if exists:
                 raise HTTPException(
@@ -417,7 +445,7 @@ async def generate_daily_insight(
                     detail=f"Insight already exists for {account_id} on {target_date}. Use force=true to regenerate."
                 )
 
-    background_tasks.add_task(generate_insight_task, account_id, target_date, force)
+    background_tasks.add_task(generate_insight_task, account_id, target_date, force, company_of(api_key))
 
     try:
         metrics.insight_generations_triggered.labels(
@@ -435,10 +463,16 @@ async def generate_daily_insight(
     }
 
 
-async def generate_insight_task(account_id: str, target_date: date, force: bool):
+async def generate_insight_task(account_id: str, target_date: date, force: bool, company_id: Optional[str] = None):
     start_time = datetime.utcnow()
     try:
         insight = await summary_generator.generate_daily_summary(account_id, target_date)
+        if insight and company_id:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE daily_insights SET company_id = $1 WHERE account_id = $2 AND date = $3",
+                    company_id, account_id, target_date,
+                )
         duration = (datetime.utcnow() - start_time).total_seconds()
         status = "success" if insight else "failed"
         try:
@@ -471,7 +505,10 @@ async def get_recent_insights(
     async with db_pool.acquire() as conn:
         query = "SELECT * FROM daily_insights WHERE 1=1"
         params = []
-        param_idx = 1
+        if api_key != ALL_COMPANIES:
+            params.append(api_key)
+            query += " AND company_id = $1"
+        param_idx = len(params) + 1
 
         if account_id:
             query += f" AND account_id = ${param_idx}"
@@ -498,7 +535,7 @@ async def get_recent_insights(
         params.extend([limit, offset])
 
         rows = await conn.fetch(query, *params)
-        return [DailyInsight(**dict(row)) for row in rows]
+        return [row_to_insight(row) for row in rows]
 
 
 @app.get("/insights/accounts/{account_id}/summary", tags=["Insights"])
@@ -520,7 +557,8 @@ async def get_account_insight_summary(
                    jsonb_agg(recommendations) as all_recommendations
             FROM daily_insights
             WHERE account_id = $1 AND date >= $2
-        """, account_id, cutoff_date)
+              AND ($3 = '*' OR company_id = $3)
+        """, account_id, cutoff_date, api_key)
 
         if not rows or not rows[0]['total_insights']:
             return {
@@ -549,17 +587,18 @@ async def get_account_insight_summary(
             "avg_confidence": round(float(row['avg_confidence']), 3) if row['avg_confidence'] else None,
             "avg_sentiment": round(float(row['avg_sentiment']), 3) if row['avg_sentiment'] else None,
             "recommendations_by_priority": priority_counts,
-            "insights_per_day": await get_insights_per_day(conn, account_id, cutoff_date)
+            "insights_per_day": await get_insights_per_day(conn, account_id, cutoff_date, api_key)
         }
 
 
-async def get_insights_per_day(conn, account_id: str, cutoff_date: date) -> Dict[str, int]:
+async def get_insights_per_day(conn, account_id: str, cutoff_date: date, scope: str = ALL_COMPANIES) -> Dict[str, int]:
     rows = await conn.fetch("""
         SELECT date::text, COUNT(*)
         FROM daily_insights
         WHERE account_id = $1 AND date >= $2
+          AND ($3 = '*' OR company_id = $3)
         GROUP BY date ORDER BY date DESC
-    """, account_id, cutoff_date)
+    """, account_id, cutoff_date, scope)
     return {row['date']: row['count'] for row in rows}
 
 
@@ -570,6 +609,8 @@ async def delete_account_insights(
     confirmation: bool = Query(False),
     api_key: str = Depends(verify_api_key)
 ):
+    if api_key != ALL_COMPANIES:
+        raise HTTPException(status_code=403, detail="Admin role required")
     if not confirmation:
         raise HTTPException(
             status_code=400,
@@ -623,6 +664,53 @@ async def ensure_database_tables():
             CREATE INDEX IF NOT EXISTS idx_insights_status ON daily_insights(status);
             CREATE INDEX IF NOT EXISTS idx_insights_generated ON daily_insights(generated_at);
         """)
+        await conn.execute("""
+            ALTER TABLE daily_insights ADD COLUMN IF NOT EXISTS company_id VARCHAR(100);
+            CREATE INDEX IF NOT EXISTS idx_insights_company ON daily_insights(company_id);
+
+            -- Local copies of upstream data the summary generator reads.
+            -- Fed from Kafka (`transactions`, `fraud-alerts`) by InsightConsumer.
+            CREATE TABLE IF NOT EXISTS transactions (
+                id VARCHAR(100) PRIMARY KEY,
+                account_id VARCHAR(100) NOT NULL,
+                company_id VARCHAR(100),
+                amount DECIMAL(15,2) NOT NULL,
+                currency VARCHAR(3),
+                type VARCHAR(20),
+                category VARCHAR(100),
+                vendor_id VARCHAR(100),
+                vendor_name VARCHAR(255),
+                description TEXT,
+                transaction_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status VARCHAR(20) DEFAULT 'COMPLETED',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_ie_tx_account_date ON transactions(account_id, transaction_date DESC);
+
+            CREATE TABLE IF NOT EXISTS fraud_alerts (
+                id VARCHAR(50) PRIMARY KEY,
+                transaction_id VARCHAR(100),
+                account_id VARCHAR(100) NOT NULL,
+                company_id VARCHAR(100),
+                amount DECIMAL(15,2),
+                risk_score DECIMAL(4,3),
+                risk_level VARCHAR(20),
+                fraud_type VARCHAR(50),
+                description TEXT,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_ie_alerts_account_ts ON fraud_alerts(account_id, timestamp DESC);
+
+            -- Optional business context per account (industry, goals, ...).
+            CREATE TABLE IF NOT EXISTS accounts (
+                account_id VARCHAR(100) PRIMARY KEY,
+                company_id VARCHAR(100),
+                industry VARCHAR(100),
+                company_size VARCHAR(50),
+                business_goals JSONB,
+                risk_tolerance VARCHAR(20)
+            );
+        """)
         logger.info("✅ Database tables verified")
 
 
@@ -630,8 +718,8 @@ async def warmup_caches():
     try:
         async with db_pool.acquire() as conn:
             accounts = await conn.fetch("""
-                SELECT DISTINCT account_id FROM daily_insights
-                ORDER BY generated_at DESC LIMIT 10
+                SELECT account_id FROM daily_insights
+                GROUP BY account_id ORDER BY MAX(generated_at) DESC LIMIT 10
             """)
         for account in accounts:
             await redis_client.delete(f"insight:{account['account_id']}:latest")
