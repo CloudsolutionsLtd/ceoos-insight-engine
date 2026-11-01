@@ -21,8 +21,10 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from src.config import settings
 from src.generators.daily_summary import DailySummaryGenerator
-from src.kafka.producer import KafkaProducer
-from src.kafka.consumer import InsightConsumer
+from src.kafka.consumer import make_handlers, TRIGGER_TOPICS
+from src.kafka.outbox import OUTBOX_DDL, OutboxProducer
+from src.kafka.reliable_consumer import ReliableConsumer, connection_kwargs
+from src.utils.tenant import TENANT_SQL, setting_value, use_tenant
 from src.models.insight import DailyInsight, InsightType, InsightPriority, InsightStatus
 from src.utils.logging import setup_logging, get_logger
 from src.utils.metrics import setup_metrics, track_request
@@ -43,9 +45,9 @@ metrics = setup_metrics()
 # Global objects
 redis_client: Optional[redis.Redis] = None
 db_pool: Optional[asyncpg.Pool] = None
-kafka_producer: Optional[KafkaProducer] = None
+kafka_producer: Optional[OutboxProducer] = None
 summary_generator: Optional[DailySummaryGenerator] = None
-kafka_consumer: Optional[InsightConsumer] = None
+kafka_consumer: Optional[ReliableConsumer] = None
 openai_client: Optional[openai.AsyncOpenAI] = None
 
 # Constants
@@ -65,6 +67,10 @@ async def _init_db_connection(conn) -> None:
         )
 
 
+async def _tag_tenant(conn) -> None:
+    await conn.execute("SELECT set_config('ceoos.tenant', $1, false)", setting_value())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client, db_pool, kafka_producer, summary_generator, kafka_consumer, openai_client
@@ -78,20 +84,19 @@ async def lifespan(app: FastAPI):
     try:
         # Initialize Redis
         logger.info("Connecting to Redis...")
-        redis_client = redis.Redis(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            password=settings.redis_password,
-            db=settings.redis_db,
-            decode_responses=True,
-            ssl=settings.redis_tls,
-            socket_timeout=5,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
-            health_check_interval=30
-        )
-        await redis_client.ping()
-        logger.info("✅ Connected to Redis")
+        common = dict(password=settings.redis_password or None, decode_responses=True, ssl=settings.redis_tls,
+                      socket_timeout=5, socket_connect_timeout=5, health_check_interval=30)
+        if settings.redis_cluster:
+            from redis.asyncio.cluster import RedisCluster
+            redis_client = RedisCluster(host=settings.redis_host, port=settings.redis_port, **common)
+        else:
+            redis_client = redis.Redis(host=settings.redis_host, port=settings.redis_port, db=settings.redis_db,
+                                       retry_on_timeout=True, **common)
+        try:
+            await redis_client.ping()
+            logger.info("✅ Connected to Redis")
+        except Exception as e:  # /ready reports it; don't crash-loop
+            logger.error(f"Redis unavailable at startup: {e}")
 
         # Initialize PostgreSQL
         logger.info("Connecting to PostgreSQL...")
@@ -103,35 +108,33 @@ async def lifespan(app: FastAPI):
             password=settings.postgres_password,
             min_size=settings.db_pool_min_size or 5,
             max_size=settings.db_pool_max_size or 20,
-            command_timeout=60,
+            command_timeout=settings.db_statement_timeout_ms / 1000,
             max_queries=50000,
             max_inactive_connection_lifetime=300,
             server_settings={
                 'timezone': 'UTC',
-                'application_name': 'insight-engine'
+                'application_name': 'insight-engine',
+                'statement_timeout': str(settings.db_statement_timeout_ms),
             },
             ssl="require" if settings.postgres_ssl else None,
             init=_init_db_connection,
+            # Tag every checkout with the caller's tenant (see utils/tenant.py).
+            setup=_tag_tenant,
         )
         async with db_pool.acquire() as conn:
             await conn.execute("SELECT 1")
         logger.info("✅ Connected to PostgreSQL")
 
-        # Initialize Kafka producer — non-fatal if unavailable
-        logger.info("Connecting to Kafka...")
-        try:
-            kafka_producer = KafkaProducer(
-                bootstrap_servers=settings.kafka_bootstrap_servers,
-                client_id="insight-engine",
-                acks="all",
-                retries=3,
-                compression_type="gzip"
-            )
-            await kafka_producer.start()
-            logger.info("✅ Connected to Kafka")
-        except Exception as e:
-            logger.warning(f"⚠️ Kafka unavailable at startup: {e} — continuing without Kafka")
-            kafka_producer = None
+        if settings.run_migrations:
+            await ensure_database_tables()
+
+        # Outbox-backed producer: messages are durable in Postgres and relayed
+        # to Kafka whenever it is reachable.
+        kafka_conn = connection_kwargs(settings.kafka_bootstrap_servers, settings.kafka_ssl,
+                                       settings.kafka_sasl_mechanism, settings.kafka_sasl_username,
+                                       settings.kafka_sasl_password)
+        kafka_producer = OutboxProducer(db_pool, kafka_conn, client_id="insight-engine")
+        kafka_producer.start()
 
         # Initialize OpenAI if configured
         if settings.openai_api_key:
@@ -156,18 +159,15 @@ async def lifespan(app: FastAPI):
         )
         logger.info("✅ Daily Summary Generator initialized")
 
-        # Start Kafka consumer — non-fatal if unavailable
-        logger.info("Starting Kafka consumer...")
-        try:
-            kafka_consumer = InsightConsumer(summary_generator, db_pool)
-            asyncio.create_task(kafka_consumer.start())
-            logger.info("✅ Kafka consumer started")
-        except Exception as e:
-            logger.warning(f"⚠️ Kafka consumer failed to start: {e}")
-            kafka_consumer = None
-
-        # Create database tables if needed
-        await ensure_database_tables()
+        # At-least-once consumer with retries + DLQ; reconnects on its own.
+        kafka_consumer = ReliableConsumer(
+            topics=[*TRIGGER_TOPICS, settings.kafka_transactions_topic, settings.kafka_fraud_alerts_topic],
+            group_id=settings.kafka_group_id,
+            handlers=make_handlers(summary_generator, db_pool),
+            conn=kafka_conn,
+            client_id="insight-engine",
+        )
+        kafka_consumer.start()
 
         # Warm up caches
         asyncio.create_task(warmup_caches())
@@ -341,7 +341,7 @@ async def health_check():
         health_status["status"] = "degraded"
 
     # Check Kafka (non-fatal)
-    if kafka_producer and kafka_producer.producer:
+    if kafka_producer and kafka_producer.connected:
         health_status["dependencies"]["kafka"] = {
             "status": "connected",
             "brokers": settings.kafka_bootstrap_servers
@@ -359,6 +359,13 @@ async def health_check():
 
 @app.get("/ready", tags=["System"])
 async def ready_check():
+    """Take traffic only when Postgres and Redis answer."""
+    try:
+        async with db_pool.acquire(timeout=2) as conn:
+            await conn.fetchval("SELECT 1")
+        await asyncio.wait_for(redis_client.ping(), 2)
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "error": type(e).__name__})
     return {"status": "ready", "timestamp": datetime.utcnow().isoformat()}
 
 
@@ -466,13 +473,10 @@ async def generate_daily_insight(
 async def generate_insight_task(account_id: str, target_date: date, force: bool, company_id: Optional[str] = None):
     start_time = datetime.utcnow()
     try:
-        insight = await summary_generator.generate_daily_summary(account_id, target_date)
-        if insight and company_id:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE daily_insights SET company_id = $1 WHERE account_id = $2 AND date = $3",
-                    company_id, account_id, target_date,
-                )
+        # Generate within the caller's tenant: reads only its data, stores
+        # the insight under its company id.
+        with use_tenant(company_id):
+            insight = await summary_generator.generate_daily_summary(account_id, target_date)
         duration = (datetime.utcnow() - start_time).total_seconds()
         status = "success" if insight else "failed"
         try:
@@ -630,7 +634,9 @@ async def delete_account_insights(
 # ============================================================================
 
 async def ensure_database_tables():
-    async with db_pool.acquire() as conn:
+    """Idempotent schema. Advisory lock: replicas / the migration Job never race."""
+    async with db_pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(727277)")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS daily_insights (
                 id VARCHAR(50) PRIMARY KEY,
@@ -653,7 +659,8 @@ async def ensure_database_tables():
                 generated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 period_start TIMESTAMP WITH TIME ZONE,
                 period_end TIMESTAMP WITH TIME ZONE,
-                UNIQUE(account_id, date)
+                company_id VARCHAR(100) NOT NULL DEFAULT '',
+                UNIQUE(company_id, account_id, date)
             )
         """)
         await conn.execute("""
@@ -669,7 +676,7 @@ async def ensure_database_tables():
             CREATE INDEX IF NOT EXISTS idx_insights_company ON daily_insights(company_id);
 
             -- Local copies of upstream data the summary generator reads.
-            -- Fed from Kafka (`transactions`, `fraud-alerts`) by InsightConsumer.
+            -- Fed from Kafka (`transactions`, `fraud-alerts`) by the Kafka handlers (src/kafka/consumer.py).
             CREATE TABLE IF NOT EXISTS transactions (
                 id VARCHAR(100) PRIMARY KEY,
                 account_id VARCHAR(100) NOT NULL,
@@ -710,6 +717,33 @@ async def ensure_database_tables():
                 business_goals JSONB,
                 risk_tolerance VARCHAR(20)
             );
+        """)
+        # Tenant isolation: ids/account numbers are only unique per institution.
+        await conn.execute(TENANT_SQL)
+        await conn.execute(OUTBOX_DDL)
+        await conn.execute("""
+            UPDATE transactions SET company_id = '' WHERE company_id IS NULL;
+            ALTER TABLE transactions ALTER COLUMN company_id SET DEFAULT '';
+            ALTER TABLE transactions ALTER COLUMN company_id SET NOT NULL;
+            UPDATE daily_insights SET company_id = '' WHERE company_id IS NULL;
+            ALTER TABLE daily_insights ALTER COLUMN company_id SET DEFAULT '';
+            ALTER TABLE daily_insights ALTER COLUMN company_id SET NOT NULL;
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                               WHERE t.relname = 'transactions' AND c.contype = 'p'
+                                 AND array_length(c.conkey, 1) = 2) THEN
+                    ALTER TABLE transactions DROP CONSTRAINT IF EXISTS transactions_pkey;
+                    ALTER TABLE transactions ADD CONSTRAINT transactions_pkey PRIMARY KEY (company_id, id);
+                END IF;
+                ALTER TABLE daily_insights DROP CONSTRAINT IF EXISTS daily_insights_account_id_date_key;
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'daily_insights_tenant_account_date_key') THEN
+                    ALTER TABLE daily_insights ADD CONSTRAINT daily_insights_tenant_account_date_key
+                        UNIQUE (company_id, account_id, date);
+                END IF;
+            END $$;
+            CREATE INDEX IF NOT EXISTS idx_ie_tx_company_account_date
+                ON transactions(company_id, account_id, transaction_date DESC);
         """)
         logger.info("✅ Database tables verified")
 
